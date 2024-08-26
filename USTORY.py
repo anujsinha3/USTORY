@@ -6,18 +6,19 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer
 from scipy.spatial import distance
 from scipy.sparse import vstack
-import torch
-from sentence_transformers import SentenceTransformer
 
-from spherical_kmeans import SphericalKMeans
+
 import b3
 
 from warnings import simplefilter # import warnings filter and ignore all future warnings
+
+from spherical_kmean_v2 import SphericalKMeans
+
 simplefilter(action='ignore', category=FutureWarning)
 
-
-def simulate(file_path, window_size, slide_size, num_windows,
-             min_articles, N, T, keyword_score, verbose, story_label,
+# TODO: ANUJ added default values for ease of function call
+def simulate(file_path, window_size=7, slide_size=1, num_windows=365,
+             min_articles=8, N=10, T=2, keyword_score='tfidf', verbose=False, story_label=True,
              time_aware = True, theme_aware = True):
 
     article_df, all_vocab = read_dataset(file_path, story_label, verbose)
@@ -90,7 +91,7 @@ def simulate(file_path, window_size, slide_size, num_windows,
                                             time_aware, theme_aware, 
                                             cluster_topN_indices, cluster_topN_scores)
 
-        ## [3] Cluster outliers 
+        ## [3] Cluster outliers
         window, cluster_centers, cluster_emb_sum_dics, cluster_tf_sum_dics, cluster_time = cluster_outliers(
                                                                         window, cluster_centers, 
                                                                         cluster_emb_sum_dics, cluster_tf_sum_dics, 
@@ -134,7 +135,8 @@ def read_dataset(file_name, story_label, verbose):
 
     tfidf_vectorizer = TfidfVectorizer(ngram_range=(1,2), tokenizer=lambda x: x, lowercase=False, norm=None)
     tfidf_vectorizer.fit_transform([sum(k, []) for k in article_df['sentence_tokens']])
-    all_vocab = tfidf_vectorizer.get_feature_names()
+    # TODO: ANUJ changed it from get_feature_names() to get_feature_names_out()
+    all_vocab = tfidf_vectorizer.get_feature_names_out()
 
     count_vectorizer = CountVectorizer(tokenizer=lambda x: x, ngram_range = (1,2), vocabulary = list(all_vocab), lowercase=False)
     article_df['sentence_TFs'] = [count_vectorizer.transform(y) for y in article_df['sentence_tokens'].values]
@@ -223,33 +225,38 @@ def get_cluster_theme(window, window_size, to_date, time_aware, cluster_tf_sum_d
                 if time_delta >= window_size: break # only consider window context
                 cluster_tf_dic[cluster_id] += np.exp(-time_delta/decaying_factor)*cluster_tf_sum_dics[cluster_id][date] 
         else: #normal cluster tf
-            cluster_tf_dic[cluster_id] = np.sum(window[window['cluster']==cluster_id].article_TF)  
-            
-    cluster_tf = vstack(cluster_tf_dic.values())
-    cluster_df = np.bincount(cluster_tf.indices, minlength=cluster_tf.shape[1]).reshape(1,-1)
-    cluster_idf = np.log((len(cluster_ids)+1)/(cluster_df+1))+1 #scikit-learn formual = log((N+1)/(df+1))+1
-    
-    if keyword_score == 'tfidf':
-        cluster_keyword_score_all = cluster_tf.multiply(cluster_idf).tocsr()
-    elif keyword_score == 'bm25':
-        k1 = 1.2
-        b = 0.75
-        d = 1.0
-        avgDL = np.sum(cluster_tf)/len(cluster_ids)        
-        cluster_ntf = cluster_tf.multiply(1/np.array(1-b+b*np.sum(cluster_tf,axis=1)/avgDL))
-        cluster_ntf.data = ((k1 + 1) * cluster_ntf.data)  / (k1 + cluster_ntf.data) + d# tf normalization - eq4 in Yuanhua 2011
-        cluster_keyword_score_all = cluster_ntf.multiply(cluster_idf).tocsr()
-    
+            cluster_tf_dic[cluster_id] = np.sum(window[window['cluster']==cluster_id].article_TF)
+
+    # TODO: ANUJ added the try catch block below
     cluster_topN_indices = {}
     cluster_topN_scores = {}
     cluster_topN_probs = {}
-    for i in range(len(cluster_ids)):
-        cluster_id = cluster_ids[i]
-        cluster_topN_indices[cluster_id] = cluster_keyword_score_all[i].indices[cluster_keyword_score_all[i].data.argsort()[:-(N+1):-1]]
-        cluster_topN_scores[cluster_id] = cluster_keyword_score_all[i][:,cluster_topN_indices[cluster_id]]
-        cluster_topN_tfs = cluster_tf_dic[cluster_id][:,cluster_topN_indices[cluster_id]]
-        cluster_topN_probs[cluster_id] = [np.round(x,5) for x in (cluster_topN_tfs/np.sum(cluster_topN_tfs)).toarray()[0]] #rounding to avoid scipy js error (approximately same probs return na)
-        
+    try:
+        cluster_tf = vstack(cluster_tf_dic.values())
+
+        cluster_df = np.bincount(cluster_tf.indices, minlength=cluster_tf.shape[1]).reshape(1,-1)
+        cluster_idf = np.log((len(cluster_ids)+1)/(cluster_df+1))+1 #scikit-learn formual = log((N+1)/(df+1))+1
+
+    
+        if keyword_score == 'tfidf':
+            cluster_keyword_score_all = cluster_tf.multiply(cluster_idf).tocsr()
+        elif keyword_score == 'bm25':
+            k1 = 1.2
+            b = 0.75
+            d = 1.0
+            avgDL = np.sum(cluster_tf)/len(cluster_ids)
+            cluster_ntf = cluster_tf.multiply(1/np.array(1-b+b*np.sum(cluster_tf,axis=1)/avgDL))
+            cluster_ntf.data = ((k1 + 1) * cluster_ntf.data)  / (k1 + cluster_ntf.data) + d# tf normalization - eq4 in Yuanhua 2011
+            cluster_keyword_score_all = cluster_ntf.multiply(cluster_idf).tocsr()
+
+        for i in range(len(cluster_ids)):
+            cluster_id = cluster_ids[i]
+            cluster_topN_indices[cluster_id] = cluster_keyword_score_all[i].indices[cluster_keyword_score_all[i].data.argsort()[:-(N+1):-1]]
+            cluster_topN_scores[cluster_id] = cluster_keyword_score_all[i][:,cluster_topN_indices[cluster_id]]
+            cluster_topN_tfs = cluster_tf_dic[cluster_id][:,cluster_topN_indices[cluster_id]]
+            cluster_topN_probs[cluster_id] = [np.round(x,5) for x in (cluster_topN_tfs/np.sum(cluster_topN_tfs)).toarray()[0]] #rounding to avoid scipy js error (approximately same probs return na)
+    except Exception as wx:
+        pass
     return cluster_topN_indices, cluster_topN_scores, cluster_topN_probs, time.time() - start_time
 
 
@@ -274,8 +281,14 @@ def assign_to_clusters(initial, verbose, window, window_size, to_date, cluster_c
         sentence_raw_weights_all = {}
         article_topN_tfs_all = {}
         for cluster_id in considered_center_indices:
-            sentence_raw_weights_all[cluster_id] = np.array(np.sum(sentence_tfs_all[:,cluster_topN_indices[cluster_id]].multiply(cluster_topN_scores[cluster_id]), axis=1)).ravel()                       
-            article_topN_tfs_all[cluster_id] = article_tfs_all[:,cluster_topN_indices[cluster_id]].toarray()
+            # TODO: ANUJ's NEW CODE
+            sentence_raw_weights_all[cluster_id] = np.array(
+                np.sum(sentence_tfs_all[:, cluster_topN_indices.get(cluster_id, cluster_id)].multiply(cluster_topN_scores.get(cluster_id, cluster_id)),
+                       axis=1)).ravel()
+            article_topN_tfs_all[cluster_id] = article_tfs_all[:, cluster_topN_indices.get(cluster_id, cluster_id)].toarray()
+            # TODO: ANUJ commented out
+            # sentence_raw_weights_all[cluster_id] = np.array(np.sum(sentence_tfs_all[:,cluster_topN_indices[cluster_id]].multiply(cluster_topN_scores[cluster_id]), axis=1)).ravel()
+            # article_topN_tfs_all[cluster_id] = article_tfs_all[:,cluster_topN_indices[cluster_id]].toarray()
             
     if time_aware:
         time_weighted_center_dic = {}
@@ -325,7 +338,8 @@ def assign_to_clusters(initial, verbose, window, window_size, to_date, cluster_c
                 
                 if sum(sentence_raw_weights) > 0:
                     article_topN_tfs = article_topN_tfs_all[cluster_id][num_processed_articles]
-                    p_cluster  = cluster_topN_probs[cluster_id]
+                    # TODO: ANUJ updated the p_cluster access from dictionary with default.
+                    p_cluster  = cluster_topN_probs.get(cluster_id, cluster_id)
                     p_article = (article_topN_tfs/np.sum(article_topN_tfs))
                     js_sim = 1 - distance.jensenshannon(p_cluster,p_article)
                 else:
@@ -422,3 +436,8 @@ def update_cluster_keywords_articles(i, window, all_vocab, cluster_keywords_df, 
         cluster_keywords_df.at[i,k] = ''
         cluster_keywords_df.at[i,k] = [all_vocab[i] for i in cluster_topN_indices[k]]
     return cluster_keywords_df
+
+
+file_path = '/Users/anujsinha/USTORY/Newsfeed_raw_output.json'
+output = simulate(file_path)
+print("fscore: ", output[-1])
